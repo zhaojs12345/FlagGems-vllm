@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import gc
+import json
 import math
 import os
+import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Generator, List, Optional, Tuple
 
 import pytest
@@ -36,6 +39,13 @@ from .consts import (
     check_metric_dependencies,
     model_shapes,
 )
+
+# 导入硬件规格以获取各厂商峰值算力
+sys.path.insert(0, str(Path(__file__).parent.parent / "conf"))
+try:
+    import hardware_specs as hw
+except ImportError:
+    hw = None
 
 torch_backend_device = flaggems_vllm.runtime.torch_backend_device
 torch_device_fn = flaggems_vllm.runtime.torch_device_fn
@@ -120,10 +130,97 @@ class Benchmark:
         self.to_bench_dtypes = self.dtypes
         self.to_bench_metrics = self.metrics
 
+        # Load baseline data if available (for normalized speedup calculation)
+        self._baseline_data = self._load_baseline_data()
+
         # additional properties
         for k in kwargs:
             if hasattr(self, k):
                 setattr(self, k, kwargs[k])
+
+    def _load_baseline_data(self):
+        """
+        加载 op_perf_baseline.json（如果存在）。
+
+        返回 dict，格式：
+        {
+            "op_name": {
+                "shapes": {
+                    "[M, N]": {
+                        "torch.dtype": {
+                            "latency_ms": float,
+                            "cuda_flops": float,
+                            "sm_utilization": float
+                        }
+                    }
+                }
+            }
+        }
+        """
+        baseline_path = Path(__file__).parent.parent / "op_perf_baseline.json"
+        if not baseline_path.exists():
+            return None
+
+        try:
+            with open(baseline_path) as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[WARN] 无法加载 baseline 数据: {e}")
+            return None
+
+    def _get_baseline_entry(self, shape, dtype):
+        """
+        从 baseline 数据中查找对应的 (shape, dtype) 条目。
+
+        返回 {"latency_ms": ..., "cuda_flops": ..., "sm_utilization": ...} 或 None
+        """
+        if self._baseline_data is None:
+            return None
+
+        op_data = self._baseline_data.get(self.op_name)
+        if op_data is None:
+            return None
+
+        shape_key = str(list(shape))  # [1, 256]
+        dtype_key = str(dtype)        # torch.bfloat16
+
+        shapes_data = op_data.get("shapes", {})
+        shape_data = shapes_data.get(shape_key, {})
+        return shape_data.get(dtype_key)
+
+    def _compute_normalized_speedup(self, baseline_entry, latency_gems_ms, dtype):
+        """
+        计算归一化 speedup（baseline 数据 + 当前厂商算力）。
+
+        公式:
+            gems_effective_tflops = (cuda_flops / 1e12) / (latency_gems_ms / 1000)
+            speedup = (gems_effective_tflops / vendor_peak_tflops) / sm_utilization_nv
+
+        返回 speedup (float) 或 None
+        """
+        if hw is None:
+            return None
+
+        cuda_flops = baseline_entry.get("cuda_flops", 0)
+        sm_util_nv = baseline_entry.get("sm_utilization", 1.0)
+
+        if cuda_flops == 0 or sm_util_nv == 0:
+            return None
+
+        # 获取当前厂商的峰值算力
+        try:
+            vendor_peak_tflops = hw.get_compute(vendor_name, dtype, prefer="measured")
+            if vendor_peak_tflops is None:
+                return None
+        except Exception:
+            return None
+
+        # gems 在当前厂商上的有效算力
+        gems_effective_tflops = (cuda_flops / 1e12) / (latency_gems_ms / 1000)
+
+        # 归一化 speedup
+        speedup = (gems_effective_tflops / vendor_peak_tflops) / sm_util_nv
+        return speedup
 
     def set_metrics(self, user_desired_metrics: Optional[List[str]]):
         # Validate user-specified metrics
@@ -437,10 +534,33 @@ class Benchmark:
                 try:
                     args, kwargs = self.unpack_to_args_kwargs(input)
                     metric.shape_detail = self.record_shapes(*args, **kwargs)
+
+                    # 尝试从 baseline 数据获取参考值
+                    shape = metric.shape_detail
+                    if isinstance(shape, (list, tuple)) and len(shape) > 0:
+                        # 提取实际 shape（可能嵌套在 list 里）
+                        if isinstance(shape[0], (list, tuple)):
+                            actual_shape = shape[0]
+                        else:
+                            actual_shape = shape
+                    else:
+                        actual_shape = None
+
+                    baseline_entry = None
+                    if actual_shape:
+                        baseline_entry = self._get_baseline_entry(actual_shape, dtype)
+
+                    # 计算 latency_base：优先使用 baseline，否则回退 torch_op
                     if "latency_base" in self.to_bench_metrics:
-                        metric.latency_base = self.get_latency(
-                            self.torch_op, *args, **kwargs
-                        )
+                        if baseline_entry is not None:
+                            # 使用 baseline 数据
+                            metric.latency_base = baseline_entry.get("latency_ms", 0)
+                        else:
+                            # 回退到 torch_op
+                            metric.latency_base = self.get_latency(
+                                self.torch_op, *args, **kwargs
+                            )
+
                     if "latency" in self.to_bench_metrics:
                         if self.gems_op:
                             metric.latency = self.get_latency(
@@ -459,8 +579,22 @@ class Benchmark:
                                     metric.latency = self.get_latency(
                                         self.torch_op, *args, **kwargs
                                     )
+
+                    # 计算 speedup：优先使用归一化公式，否则直接相除
                     if "speedup" in self.to_bench_metrics:
-                        metric.speedup = metric.latency_base / metric.latency
+                        if baseline_entry is not None and metric.latency:
+                            # 使用归一化公式
+                            normalized_speedup = self._compute_normalized_speedup(
+                                baseline_entry, metric.latency, dtype
+                            )
+                            if normalized_speedup is not None:
+                                metric.speedup = normalized_speedup
+                            else:
+                                # 归一化失败，回退直接相除
+                                metric.speedup = metric.latency_base / metric.latency
+                        else:
+                            # 无 baseline，直接相除
+                            metric.speedup = metric.latency_base / metric.latency
 
                     if "gbps" in self.to_bench_metrics:
                         metric.gbps_base = self.get_gbps(

@@ -1,0 +1,55 @@
+# Baseline 采集配置
+# 记录关键算子的 shape/dtype，用于生成 NVIDIA baseline 数据
+#
+# 每个算子需指定：
+#   - native_api: vLLM 原生 CUDA kernel 的调用路径
+#   - shapes: 需要测试的 shape 列表
+#   - dtypes: 需要测试的数据类型列表
+
+silu_and_mul:
+  # vLLM 原生 API（两参数形式：x, gate）
+  native_api: "vllm._C.silu_and_mul"
+
+  # 生产模型 shape（deepseek_v4_flash + qwen3_6_35b_a3b）
+  shapes:
+    # (token, 256) pattern
+    - [1, 256]
+    - [2, 256]
+    - [4, 256]
+    - [8, 256]
+    - [16, 256]
+    - [32, 256]
+    - [64, 256]
+    - [128, 256]
+    - [256, 256]
+    - [512, 256]
+    - [1024, 256]
+    - [2048, 256]
+    - [4096, 256]
+    - [8192, 256]
+
+    # (token, 512) pattern
+    - [1, 512]
+    - [2, 512]
+    - [4, 512]
+    - [8, 512]
+    - [16, 512]
+    - [32, 512]
+    - [64, 512]
+    - [128, 512]
+    - [256, 512]
+    - [512, 512]
+    - [1024, 512]
+    - [2048, 512]
+    - [4096, 512]
+    - [8192, 512]
+
+  dtypes:
+    - torch.bfloat16
+    - torch.float16
+
+# 未来可扩展其他算子：
+# other_op:
+#   native_api: "vllm._C.other_op"
+#   shapes: [...]
+#   dtypes: [...]

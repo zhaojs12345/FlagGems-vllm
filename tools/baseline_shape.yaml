@@ -1,55 +1,36 @@
-# Baseline 采集配置
-# 记录关键算子的 shape/dtype，用于生成 NVIDIA baseline 数据
+# Baseline 采集配置（方案B：每个算子自包含声明 native 调用 + shape + 输入构造）
 #
-# 每个算子需指定：
-#   - native_api: vLLM 原生 CUDA kernel 的调用路径
-#   - shapes: 需要测试的 shape 列表
-#   - dtypes: 需要测试的数据类型列表
+# 仅收录 benchmark/ 里【确实调用 NV 原生 kernel】的算子；纯 torch 参考的
+# 算子（如 silu_and_mul、add_rms_norm 的 torch_op 都是 torch 组合，无原生
+# kernel）不在此列。逐步添加。
+#
+# 每个算子字段：
+#   native.module / native.symbol : NV 原生 callable 的解析坐标，交给
+#       collect_baseline_nvidia.resolve_native_op(module, symbol) 解析：
+#       族A  torch.ops._C / torch.ops._moe_C.<symbol>
+#       族B  vllm._custom_ops.<symbol>
+#       族C  vllm 内部 kernel 模块.<symbol>
+#   dtypes : 遍历的数据类型（字符串，形如 torch.bfloat16）。
+#   grid   : 基准维度取值；对各维度做笛卡尔积，每个组合是一个采集点。
+#   inputs : 按位置构造 native 调用实参（op(*inputs)）。每项二选一：
+#       {tensor: [<dim名 或 int 或 "2*dim">, ...]}  torch.randn 造张量
+#       {scalar: <值>}                              直接作为标量传入
+#   key_dims : 可选，用作 JSON 主键(对应 benchmark 的 shape)的维度列表；
+#       缺省取第一个 tensor 输入的 shape。
 
-silu_and_mul:
-  # vLLM 原生 API（两参数形式：x, gate）
-  native_api: "vllm._C.silu_and_mul"
-
-  # 生产模型 shape（deepseek_v4_flash + qwen3_6_35b_a3b）
-  shapes:
-    # (token, 256) pattern
-    - [1, 256]
-    - [2, 256]
-    - [4, 256]
-    - [8, 256]
-    - [16, 256]
-    - [32, 256]
-    - [64, 256]
-    - [128, 256]
-    - [256, 256]
-    - [512, 256]
-    - [1024, 256]
-    - [2048, 256]
-    - [4096, 256]
-    - [8192, 256]
-
-    # (token, 512) pattern
-    - [1, 512]
-    - [2, 512]
-    - [4, 512]
-    - [8, 512]
-    - [16, 512]
-    - [32, 512]
-    - [64, 512]
-    - [128, 512]
-    - [256, 512]
-    - [512, 512]
-    - [1024, 512]
-    - [2048, 512]
-    - [4096, 512]
-    - [8192, 512]
-
-  dtypes:
-    - torch.bfloat16
-    - torch.float16
-
-# 未来可扩展其他算子：
-# other_op:
-#   native_api: "vllm._C.other_op"
-#   shapes: [...]
-#   dtypes: [...]
+fused_add_rms_norm:
+  # torch.ops._C.fused_add_rms_norm(input, residual, weight, eps)
+  # input/residual 原地写回，无返回值。见 benchmark/test_fused_add_rms_norm.py。
+  native:
+    module: torch.ops._C
+    symbol: fused_add_rms_norm
+  dtypes: [torch.bfloat16, torch.float16]
+  grid:
+    M: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    N: [256, 512]
+  inputs:
+    - {tensor: [M, N]}    # input   （原地写回）
+    - {tensor: [M, N]}    # residual（原地写回）
+    - {tensor: [N]}       # weight
+    - {scalar: 1.0e-5}    # eps
+  key_dims: [M, N]

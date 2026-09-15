@@ -343,6 +343,20 @@ def _collect_one_op(op_name, op_cfg, ncu_enabled, report_dir):
 
     dtypes = op_cfg["dtypes"]
     bindings = _expand_grid(op_cfg["grid"])
+
+    # 预检：解析到的 callable 可能只注册了 schema、没有 CUDA kernel（如本环境把
+    # vLLM 原生 kernel 换成了 Triton），真调才暴露 NotImplementedError。用最小的
+    # 那个 shape 试调一次，没实现就整体跳过，避免逐点崩掉。
+    probe = _instantiate_args(_resolve_inputs(op_cfg["inputs"], bindings[0],
+                                              dtypes[0]))
+    try:
+        op(*probe)
+        torch.cuda.synchronize()
+    except NotImplementedError as e:
+        print(f"\n跳过算子 {op_name}: native {module}.{symbol} 无 CUDA 实现 "
+              f"（{str(e)[:80]}）")
+        return None
+
     shapes = {}
     print(f"\n采集算子: {op_name}  (native {module}.{symbol})")
     for binding in bindings:

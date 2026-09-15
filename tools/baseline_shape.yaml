@@ -22,7 +22,7 @@ fused_add_rms_norm:
   # torch.ops._C.fused_add_rms_norm(input, residual, weight, eps)
   # input/residual 原地写回，无返回值。见 benchmark/test_fused_add_rms_norm.py。
   native:
-    module: torch.ops._C
+    module: vllm._custom_ops
     symbol: fused_add_rms_norm
   dtypes: [torch.bfloat16, torch.float16]
   grid:

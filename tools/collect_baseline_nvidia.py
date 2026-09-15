@@ -124,13 +124,22 @@ def _resolve_dim(token, binding):
 
 
 def _resolve_inputs(input_specs, binding, dtype_str):
-    """把 yaml 的 inputs 规范 + 一组维度绑定，解析成可实例化的具体描述：
-    张量 -> {"tensor": [具体int形状], "dtype": dtype_str}；标量 -> {"scalar": v}。"""
+    """把 yaml 的 inputs 规范 + 一组维度绑定，解析成可实例化的具体描述。
+    张量 -> {"tensor": [具体int形状], "dtype": ..., "fill": ..., low/high?}；
+    标量 -> {"scalar": v}。tensor 的 dtype 缺省用算子遍历的 dtype_str，
+    fill 缺省 randn。"""
     resolved = []
     for spec in input_specs:
         if "tensor" in spec:
-            shape = [_resolve_dim(t, binding) for t in spec["tensor"]]
-            resolved.append({"tensor": shape, "dtype": dtype_str})
+            item = {
+                "tensor": [_resolve_dim(t, binding) for t in spec["tensor"]],
+                "dtype": spec.get("dtype", dtype_str),
+                "fill": spec.get("fill", "randn"),
+            }
+            if item["fill"] == "randint":
+                item["low"] = spec.get("low", 0)
+                item["high"] = spec["high"]
+            resolved.append(item)
         elif "scalar" in spec:
             resolved.append({"scalar": spec["scalar"]})
         else:
@@ -139,14 +148,27 @@ def _resolve_inputs(input_specs, binding, dtype_str):
 
 
 def _instantiate_args(resolved):
-    """按具体描述在 CUDA 上实例化实参列表（张量用 randn，标量原样）。"""
+    """按具体描述在 CUDA 上实例化实参列表（按 fill 造张量，标量原样）。"""
     args = []
     for item in resolved:
-        if "tensor" in item:
-            dtype = getattr(torch, item["dtype"].split(".")[-1])
-            args.append(torch.randn(item["tensor"], dtype=dtype, device="cuda"))
-        else:
+        if "scalar" in item:
             args.append(item["scalar"])
+            continue
+        shape, fill = item["tensor"], item["fill"]
+        dtype = getattr(torch, item["dtype"].split(".")[-1])
+        if fill == "randn":
+            args.append(torch.randn(shape, dtype=dtype, device="cuda"))
+        elif fill == "rand":
+            args.append(torch.rand(shape, dtype=dtype, device="cuda"))
+        elif fill == "zeros":
+            args.append(torch.zeros(shape, dtype=dtype, device="cuda"))
+        elif fill == "empty":
+            args.append(torch.empty(shape, dtype=dtype, device="cuda"))
+        elif fill == "randint":
+            args.append(torch.randint(item["low"], item["high"], tuple(shape),
+                                      dtype=dtype, device="cuda"))
+        else:
+            raise ValueError(f"未知 fill: {fill}")
     return args
 
 
@@ -203,11 +225,22 @@ def _make_args():
     specs = {resolved_inputs!r}
     args = []
     for it in specs:
-        if "tensor" in it:
-            dt = getattr(torch, it["dtype"].split(".")[-1])
-            args.append(torch.randn(it["tensor"], dtype=dt, device="cuda"))
-        else:
+        if "scalar" in it:
             args.append(it["scalar"])
+            continue
+        dt = getattr(torch, it["dtype"].split(".")[-1])
+        shape, fill = it["tensor"], it.get("fill", "randn")
+        if fill == "randn":
+            args.append(torch.randn(shape, dtype=dt, device="cuda"))
+        elif fill == "rand":
+            args.append(torch.rand(shape, dtype=dt, device="cuda"))
+        elif fill == "zeros":
+            args.append(torch.zeros(shape, dtype=dt, device="cuda"))
+        elif fill == "empty":
+            args.append(torch.empty(shape, dtype=dt, device="cuda"))
+        elif fill == "randint":
+            args.append(torch.randint(it["low"], it["high"], tuple(shape),
+                                      dtype=dt, device="cuda"))
     return args
 
 

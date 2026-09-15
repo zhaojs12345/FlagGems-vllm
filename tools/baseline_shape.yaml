@@ -13,8 +13,14 @@
 #   dtypes : 遍历的数据类型（字符串，形如 torch.bfloat16）。
 #   grid   : 基准维度取值；对各维度做笛卡尔积，每个组合是一个采集点。
 #   inputs : 按位置构造 native 调用实参（op(*inputs)）。每项二选一：
-#       {tensor: [<dim名 或 int 或 "2*dim">, ...]}  torch.randn 造张量
-#       {scalar: <值>}                              直接作为标量传入
+#       {tensor: [<dim名 或 int 或 "2*dim">, ...], dtype: <可选>, fill: <可选>,
+#                low/high: <randint 用>}
+#           tensor : 形状，维度支持「dim名 / int / "系数*dim名"」。
+#           dtype  : 该张量 dtype（缺省用算子的 dtypes 遍历值）；标签算子里
+#                    索引/长度类张量常固定为 torch.int32、bias 常为 torch.float32。
+#           fill   : randn(默认) / rand / zeros / empty / randint。
+#           low,high: fill=randint 时的取值区间 [low, high)。
+#       {scalar: <值>}                              直接作为标量传入（含 bool）
 #   key_dims : 可选，用作 JSON 主键(对应 benchmark 的 shape)的维度列表；
 #       缺省取第一个 tensor 输入的 shape。
 
@@ -34,3 +40,27 @@ fused_add_rms_norm:
     - {tensor: [N]}       # weight
     - {scalar: 1.0e-5}    # eps
   key_dims: [M, N]
+
+grouped_topk:
+  # torch.ops._moe_C.grouped_topk(scores, n_group, topk_group, topk,
+  #     renormalize, routed_scaling_factor, bias, scoring_func)
+  # 见 benchmark/test_grouped_topk.py（Deepseek-3.2 配置，非 renorm 分支）。
+  # scores 遍历 dtype；bias 固定 fp32；后面全是标量常量。
+  native:
+    module: torch.ops._moe_C
+    symbol: grouped_topk
+  dtypes: [torch.bfloat16, torch.float16]
+  grid:
+    # num_experts/n_group/topk_group/topk 固定，仅 num_tokens 变化。
+    T: [1, 8, 32, 64, 128, 256, 496, 512, 16384]
+    E: [256]
+  inputs:
+    - {tensor: [T, E]}                    # scores（遍历 dtype）
+    - {scalar: 8}                         # n_group
+    - {scalar: 4}                         # topk_group
+    - {scalar: 8}                         # topk
+    - {scalar: true}                      # renormalize
+    - {scalar: 1.0}                       # routed_scaling_factor
+    - {tensor: [E], dtype: torch.float32} # bias
+    - {scalar: 0}                         # scoring_func
+  key_dims: [T, E]

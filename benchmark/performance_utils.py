@@ -103,6 +103,56 @@ def SkipVersion(module_name, skip_pattern):
         return (major, minor) > (M, N)
 
 
+def _first_tensor_shape(shape_detail):
+    """Return the first tensor shape found in a record_shapes() result as a
+    plain list of ints, or None if there is no tensor shape.
+
+    record_shapes() encodes tensors as torch.Size and may nest them inside
+    lists/tuples/dicts (and wrap args+kwargs in a top-level tuple), so walk the
+    structure depth-first and return the first torch.Size we hit.
+    """
+    stack = [shape_detail]
+    while stack:
+        item = stack.pop(0)
+        if isinstance(item, torch.Size):
+            return list(item)
+        if isinstance(item, dict):
+            stack[:0] = list(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack[:0] = list(item)
+    return None
+
+
+def _lookup_base_latency(base_data, op_name, dtype, shape_detail):
+    """Look up the NVIDIA baseline latency (ms) for a result, three levels deep:
+    op_name -> shape -> dtype. Returns the latency in milliseconds, or None if
+    any level is missing. Never raises: an unmatched entry just yields N/A.
+
+    Baseline layout (see tools/collect_baseline_nvidia.py):
+        base_data[op_name]["shapes"][str([d0, d1, ...])][str(dtype)]["latency_ms"]
+    The shape key is the string of the first tensor's dimensions, which matches
+    the collector's key_shape for ops like grouped_topk / fused_add_rms_norm.
+    Ops whose shape cannot be expressed this way simply won't match.
+    """
+    try:
+        op_entry = base_data.get(op_name)
+        if not op_entry:
+            return None
+        shapes = op_entry.get("shapes", {})
+        first_shape = _first_tensor_shape(shape_detail)
+        if first_shape is None:
+            return None
+        per_dtype = shapes.get(str(first_shape))
+        if not per_dtype:
+            return None
+        record = per_dtype.get(str(dtype))
+        if not record:
+            return None
+        return record.get("latency_ms")
+    except (AttributeError, TypeError):
+        return None
+
+
 class Benchmark:
     device: str = device
     DEFAULT_METRICS = DEFAULT_METRICS
@@ -463,6 +513,18 @@ class Benchmark:
                                 )
                     if "speedup" in self.to_bench_metrics:
                         metric.speedup = metric.latency_base / metric.latency
+                    if Config.base_data is not None and metric.latency:
+                        base_ms = _lookup_base_latency(
+                            Config.base_data,
+                            self.op_name,
+                            dtype,
+                            metric.shape_detail,
+                        )
+                        if base_ms is not None:
+                            # Both baseline (latency_ms) and metric.latency are
+                            # in milliseconds, so the ratio is dimensionless:
+                            # >1 means this backend is faster than the NV baseline.
+                            metric.compared_speedup = base_ms / metric.latency
                     if "gbps" in self.to_bench_metrics:
                         metric.gbps_base = self.get_gbps(
                             args, latency=metric.latency_base

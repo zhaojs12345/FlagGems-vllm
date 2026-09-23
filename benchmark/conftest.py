@@ -90,6 +90,30 @@ class BenchConfig:
         self.shape_file = os.path.join(os.path.dirname(__file__), "core_shapes.yaml")
         self.query = False
         self.parallel = 0
+        # NVIDIA baseline data loaded from --base-data; None means "not enabled",
+        # in which case behavior is identical to before this option existed.
+        self.base_data = None
+
+
+def _load_base_data(path):
+    """Load the NVIDIA baseline JSON for the optional 'vs Base' column.
+
+    Returns the parsed dict, or None when no path is given or the file cannot
+    be read/parsed. Never raises: a missing or malformed baseline must not
+    break the benchmark run (silent degradation to N/A).
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        logging.getLogger(__name__).warning(
+            "Failed to load --base-data %s: %s; 'vs Base' column disabled.",
+            path,
+            e,
+        )
+        return None
 
 
 def pytest_addoption(parser):
@@ -171,6 +195,19 @@ def pytest_addoption(parser):
         help="Specify the shape file name for benchmarks. If not specified, a default shape list will be used.",
     )
 
+    parser.addoption(
+        "--base-data",
+        action="store",
+        default=None,
+        required=False,
+        help=(
+            "Path to an NVIDIA baseline JSON (e.g. op_perf_baseline.json). "
+            "When provided, an extra 'vs Base' column comparing each result "
+            "against the baseline latency is shown. If omitted or unreadable, "
+            "the column is silently N/A and behavior is unchanged."
+        ),
+    )
+
     try:
         parser.addoption(
             "--record",
@@ -248,6 +285,8 @@ def pytest_configure(config):
 
     shape_file_str = config.getoption("--shape_file")
     Config.shape_file = shape_file_str
+
+    Config.base_data = _load_base_data(config.getoption("--base-data"))
 
     Config.record_log = config.getoption("--record") == "log"
     Config.record_json = config.getoption("--record") == "json"

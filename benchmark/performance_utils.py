@@ -631,6 +631,11 @@ class Benchmark:
                             if factor:
                                 speedup /= factor
                             metric.compared_speedup = speedup
+                            print(
+                                f"[vs Base] {self.op_name} shape={metric.shape_detail} "
+                                f"base={base_ms:.6f}ms gems={metric.latency:.6f}ms "
+                                f"factor={factor} vs_base={speedup:.3f}"
+                            )
                     if "gbps" in self.to_bench_metrics:
                         metric.gbps_base = self.get_gbps(
                             args, latency=metric.latency_base

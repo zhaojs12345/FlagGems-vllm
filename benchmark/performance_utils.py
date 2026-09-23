@@ -123,13 +123,14 @@ def _first_tensor_shape(shape_detail):
     return None
 
 
-def _lookup_base_latency(base_data, op_name, dtype, shape_detail):
-    """Look up the NVIDIA baseline latency (ms) for a result, three levels deep:
-    op_name -> shape -> dtype. Returns the latency in milliseconds, or None if
-    any level is missing. Never raises: an unmatched entry just yields N/A.
+def _lookup_base_record(base_data, op_name, dtype, shape_detail):
+    """Look up the NVIDIA baseline record for a result, three levels deep:
+    op_name -> shape -> dtype. Returns the record dict (with latency_ms,
+    bottle_neck_unit, ...), or None if any level is missing. Never raises: an
+    unmatched entry just yields N/A.
 
     Baseline layout (see tools/collect_baseline_nvidia.py):
-        base_data[op_name]["shapes"][str([d0, d1, ...])][str(dtype)]["latency_ms"]
+        base_data[op_name]["shapes"][str([d0, d1, ...])][str(dtype)]
     The shape key is the string of the first tensor's dimensions, which matches
     the collector's key_shape for ops like grouped_topk / fused_add_rms_norm.
     Ops whose shape cannot be expressed this way simply won't match.
@@ -145,10 +146,57 @@ def _lookup_base_latency(base_data, op_name, dtype, shape_detail):
         per_dtype = shapes.get(str(first_shape))
         if not per_dtype:
             return None
-        record = per_dtype.get(str(dtype))
-        if not record:
+        return per_dtype.get(str(dtype))
+    except (AttributeError, TypeError):
+        return None
+
+
+# torch dtype string -> scaling-factor dtype key (see _scaling_factors block).
+_DTYPE_TO_SF_KEY = {
+    "torch.bfloat16": "bf16",
+    "torch.float16": "fp16",
+    "torch.float32": "fp32",
+    "torch.float64": "fp64",
+    "torch.int8": "int8",
+    "torch.float8_e4m3fn": "fp8",
+    "torch.float8_e5m2": "fp8",
+}
+
+# baseline bottleneck unit -> scaling-factor resource group. mem is
+# dtype-independent (memory bandwidth); tensor/cuda pick a per-dtype compute
+# factor (Tensor Core vs CUDA Core/vector).
+_BOTTLENECK_TO_SF = {"mem": "bandwidth_gbps", "tensor": "tensor", "cuda": "vector"}
+
+
+def _lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype):
+    """Return this vendor's hardware scaling factor (vendor_peak / H800_peak)
+    for the resource that bottlenecks the baseline record, or None.
+
+    Factor comes from base_data["_scaling_factors"] (written by the collector
+    into the same file as the latencies). Prefers measured over nominal. Returns
+    None when the vendor / resource / dtype isn't covered, so the caller falls
+    back to the raw latency ratio.
+    """
+    try:
+        sf = base_data.get("_scaling_factors")
+        resource = _BOTTLENECK_TO_SF.get(bottle_neck_unit)
+        if not sf or resource is None:
             return None
-        return record.get("latency_ms")
+        chip = next((c for c in sf.get("chips", [])
+                     if c.get("vendor") == vendor), None)
+        if chip is None:
+            return None
+        for prefer in ("measured", "nominal"):
+            block = chip.get(prefer)
+            if not block:
+                continue
+            if resource == "bandwidth_gbps":
+                val = block.get("bandwidth_gbps")
+            else:
+                val = block.get(resource, {}).get(_DTYPE_TO_SF_KEY.get(str(dtype)))
+            if val:
+                return val
+        return None
     except (AttributeError, TypeError):
         return None
 
@@ -514,17 +562,33 @@ class Benchmark:
                     if "speedup" in self.to_bench_metrics:
                         metric.speedup = metric.latency_base / metric.latency
                     if Config.base_data is not None and metric.latency:
-                        base_ms = _lookup_base_latency(
+                        base_rec = _lookup_base_record(
                             Config.base_data,
                             self.op_name,
                             dtype,
                             metric.shape_detail,
                         )
+                        base_ms = base_rec.get("latency_ms") if base_rec else None
                         if base_ms is not None:
-                            # Both baseline (latency_ms) and metric.latency are
-                            # in milliseconds, so the ratio is dimensionless:
-                            # >1 means this backend is faster than the NV baseline.
-                            metric.compared_speedup = base_ms / metric.latency
+                            # Both baseline (latency_ms) and metric.latency are in
+                            # milliseconds, so the raw ratio is dimensionless.
+                            speedup = base_ms / metric.latency
+                            # Normalize away the hardware peak gap: divide by this
+                            # vendor's scaling factor for the baseline's bottleneck
+                            # resource. factor = vendor_peak / H800_peak, so a
+                            # weaker chip (factor<1) is credited accordingly; the
+                            # result is "achievement vs the chip's due share",
+                            # 1.0 meaning it hits its hardware potential. Missing
+                            # factor -> keep the raw ratio.
+                            factor = _lookup_scaling_factor(
+                                Config.base_data,
+                                vendor_name,
+                                base_rec.get("bottle_neck_unit"),
+                                dtype,
+                            )
+                            if factor:
+                                speedup /= factor
+                            metric.compared_speedup = speedup
                     if "gbps" in self.to_bench_metrics:
                         metric.gbps_base = self.get_gbps(
                             args, latency=metric.latency_base

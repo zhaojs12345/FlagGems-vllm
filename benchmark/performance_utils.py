@@ -206,9 +206,9 @@ def _lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype,
     measured over nominal. Returns None when the vendor / chip / resource /
     dtype isn't covered, so the caller falls back to the raw latency ratio.
 
-    When we're running on the baseline's own reference chip (e.g. the H800 the
-    baseline was collected on), the factor is 1.0 by definition and that chip is
-    not listed under "chips", so short-circuit to 1.0.
+    The reference chip (e.g. the H800 the baseline was collected on) is itself
+    listed under "chips" with all factors equal to 1.0, so it matches by model
+    like any other chip.
     """
     try:
         sf = base_data.get("_scaling_factors")
@@ -217,11 +217,6 @@ def _lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype,
             return None
         if self_chip is None:
             self_chip = _SELF_CHIP
-        # Running on the reference chip itself: peaks are equal, factor == 1.0.
-        # This must win before vendor matching, since the reference chip is not
-        # in "chips" and a same-vendor sibling (H100) would be matched wrongly.
-        if _chip_matches(sf.get("reference_chip"), self_chip):
-            return 1.0
         candidates = [c for c in sf.get("chips", []) if c.get("vendor") == vendor]
         if not candidates:
             return None

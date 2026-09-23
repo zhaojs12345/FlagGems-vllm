@@ -752,6 +752,8 @@ def run_benchmark_q(gpu_id, op):
 
     dur = time.time()
     cmd = f'pytest -m "{op}" --level core --record json --output benchmark_{op}.json --continue-on-collection-errors'
+    if getattr(CFG, "base_data", None):
+        cmd += f" --base-data {shlex.quote(CFG.base_data)}"
     code = run_cmd(op, cmd, cwd=benchmark_dir, env=env, flavor="performance")
     dur = time.time() - dur
 
@@ -1295,6 +1297,17 @@ def main():
         help="Save each test's stdout/stderr to log files (default: discard)",
     )
     parser.add_argument(
+        "--base-data",
+        required=False,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to an NVIDIA baseline JSON (e.g. op_perf_baseline.json). "
+            "When provided, benchmarks show an extra 'vs Base' column. "
+            "If omitted, behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--color",
         choices=["auto", "always", "never"],
         default="auto",
@@ -1303,6 +1316,7 @@ def main():
     OPTS = parser.parse_args()
     CFG.dump_output = OPTS.dump_output
     CFG.start = OPTS.start
+    CFG.base_data = OPTS.base_data
 
     # Apply color mode (IS_TTY controls cursor-based footer, USE_COLORS controls ANSI colors)
     global USE_COLORS, RED, GREEN, YELLOW, CYAN, DIM, NC

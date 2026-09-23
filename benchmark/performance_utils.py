@@ -39,6 +39,7 @@ from .attri_util import (
     OperationAttribute,
     check_metric_dependencies,
 )
+from .consts import lookup_base_record, lookup_scaling_factor
 from .conftest import Config, emit_record_logger
 
 torch_backend_device = flaggems_vllm.runtime.torch_backend_device
@@ -101,146 +102,6 @@ def SkipVersion(module_name, skip_pattern):
         return (major, minor) < (M, N)
     else:
         return (major, minor) > (M, N)
-
-
-def _first_tensor_shape(shape_detail):
-    """Return the first tensor shape found in a record_shapes() result as a
-    plain list of ints, or None if there is no tensor shape.
-
-    record_shapes() encodes tensors as torch.Size and may nest them inside
-    lists/tuples/dicts (and wrap args+kwargs in a top-level tuple), so walk the
-    structure depth-first and return the first torch.Size we hit.
-    """
-    stack = [shape_detail]
-    while stack:
-        item = stack.pop(0)
-        if isinstance(item, torch.Size):
-            return list(item)
-        if isinstance(item, dict):
-            stack[:0] = list(item.values())
-        elif isinstance(item, (list, tuple)):
-            stack[:0] = list(item)
-    return None
-
-
-def _lookup_base_record(base_data, op_name, dtype, shape_detail):
-    """Look up the NVIDIA baseline record for a result, three levels deep:
-    op_name -> shape -> dtype. Returns the record dict (with latency_ms,
-    bottle_neck_unit, ...), or None if any level is missing. Never raises: an
-    unmatched entry just yields N/A.
-
-    Baseline layout (see tools/collect_baseline_nvidia.py):
-        base_data[op_name]["shapes"][str([d0, d1, ...])][str(dtype)]
-    The shape key is the string of the first tensor's dimensions, which matches
-    the collector's key_shape for ops like grouped_topk / fused_add_rms_norm.
-    Ops whose shape cannot be expressed this way simply won't match.
-    """
-    try:
-        op_entry = base_data.get(op_name)
-        if not op_entry:
-            return None
-        shapes = op_entry.get("shapes", {})
-        first_shape = _first_tensor_shape(shape_detail)
-        if first_shape is None:
-            return None
-        per_dtype = shapes.get(str(first_shape))
-        if not per_dtype:
-            return None
-        return per_dtype.get(str(dtype))
-    except (AttributeError, TypeError):
-        return None
-
-
-# torch dtype string -> scaling-factor dtype key (see _scaling_factors block).
-_DTYPE_TO_SF_KEY = {
-    "torch.bfloat16": "bf16",
-    "torch.float16": "fp16",
-    "torch.float32": "fp32",
-    "torch.float64": "fp64",
-    "torch.int8": "int8",
-    "torch.float8_e4m3fn": "fp8",
-    "torch.float8_e5m2": "fp8",
-}
-
-# baseline bottleneck unit -> scaling-factor resource group. mem is
-# dtype-independent (memory bandwidth); tensor/cuda pick a per-dtype compute
-# factor (Tensor Core vs CUDA Core/vector).
-_BOTTLENECK_TO_SF = {"mem": "bandwidth_gbps", "tensor": "tensor", "cuda": "vector"}
-
-
-def _detect_self_chip():
-    """Best-effort name of the chip this benchmark runs on, e.g. "NVIDIA H800".
-
-    Used to pick the right scaling factor when one vendor has several chips
-    (H800 vs H100) and to recognize when we're running on the baseline's own
-    reference chip. Returns "" when the device name can't be read; callers then
-    fall back to vendor-only matching.
-    """
-    try:
-        return torch.cuda.get_device_name()
-    except Exception:
-        return ""
-
-
-# Cache the device name once; it doesn't change within a run.
-_SELF_CHIP = _detect_self_chip()
-
-
-def _chip_matches(chip_name, device_name):
-    """True if a spec's chip name (e.g. "H800") identifies this device
-    (e.g. "NVIDIA H800 80GB"). Case-insensitive substring match, which tolerates
-    the vendor prefix / memory suffix that get_device_name() adds."""
-    if not chip_name or not device_name:
-        return False
-    return chip_name.lower() in device_name.lower()
-
-
-def _lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype,
-                           self_chip=None):
-    """Return this chip's hardware scaling factor (chip_peak / reference_peak)
-    for the resource that bottlenecks the baseline record, or None.
-
-    Factor comes from base_data["_scaling_factors"] (written by the collector
-    into the same file as the latencies). Matching is by vendor AND concrete
-    chip model, so that e.g. nvidia H800 and H100 don't collide. Prefers
-    measured over nominal. Returns None when the vendor / chip / resource /
-    dtype isn't covered, so the caller falls back to the raw latency ratio.
-
-    The reference chip (e.g. the H800 the baseline was collected on) is itself
-    listed under "chips" with all factors equal to 1.0, so it matches by model
-    like any other chip.
-    """
-    try:
-        sf = base_data.get("_scaling_factors")
-        resource = _BOTTLENECK_TO_SF.get(bottle_neck_unit)
-        if not sf or resource is None:
-            return None
-        if self_chip is None:
-            self_chip = _SELF_CHIP
-        candidates = [c for c in sf.get("chips", []) if c.get("vendor") == vendor]
-        if not candidates:
-            return None
-        # Prefer the candidate whose chip model matches this device; only when a
-        # single vendor chip exists do we accept it without a model match.
-        chip = next((c for c in candidates
-                     if _chip_matches(c.get("chip"), self_chip)), None)
-        if chip is None:
-            chip = candidates[0] if len(candidates) == 1 else None
-        if chip is None:
-            return None
-        for prefer in ("measured", "nominal"):
-            block = chip.get(prefer)
-            if not block:
-                continue
-            if resource == "bandwidth_gbps":
-                val = block.get("bandwidth_gbps")
-            else:
-                val = block.get(resource, {}).get(_DTYPE_TO_SF_KEY.get(str(dtype)))
-            if val:
-                return val
-        return None
-    except (AttributeError, TypeError):
-        return None
 
 
 class Benchmark:
@@ -604,7 +465,7 @@ class Benchmark:
                     if "speedup" in self.to_bench_metrics:
                         metric.speedup = metric.latency_base / metric.latency
                     if Config.base_data is not None and metric.latency:
-                        base_rec = _lookup_base_record(
+                        base_rec = lookup_base_record(
                             Config.base_data,
                             self.op_name,
                             dtype,
@@ -622,7 +483,7 @@ class Benchmark:
                             # result is "achievement vs the chip's due share",
                             # 1.0 meaning it hits its hardware potential. Missing
                             # factor -> keep the raw ratio.
-                            factor = _lookup_scaling_factor(
+                            factor = lookup_scaling_factor(
                                 Config.base_data,
                                 vendor_name,
                                 base_rec.get("bottle_neck_unit"),

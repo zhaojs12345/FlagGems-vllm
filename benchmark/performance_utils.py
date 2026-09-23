@@ -168,22 +168,69 @@ _DTYPE_TO_SF_KEY = {
 _BOTTLENECK_TO_SF = {"mem": "bandwidth_gbps", "tensor": "tensor", "cuda": "vector"}
 
 
-def _lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype):
-    """Return this vendor's hardware scaling factor (vendor_peak / H800_peak)
+def _detect_self_chip():
+    """Best-effort name of the chip this benchmark runs on, e.g. "NVIDIA H800".
+
+    Used to pick the right scaling factor when one vendor has several chips
+    (H800 vs H100) and to recognize when we're running on the baseline's own
+    reference chip. Returns "" when the device name can't be read; callers then
+    fall back to vendor-only matching.
+    """
+    try:
+        return torch.cuda.get_device_name()
+    except Exception:
+        return ""
+
+
+# Cache the device name once; it doesn't change within a run.
+_SELF_CHIP = _detect_self_chip()
+
+
+def _chip_matches(chip_name, device_name):
+    """True if a spec's chip name (e.g. "H800") identifies this device
+    (e.g. "NVIDIA H800 80GB"). Case-insensitive substring match, which tolerates
+    the vendor prefix / memory suffix that get_device_name() adds."""
+    if not chip_name or not device_name:
+        return False
+    return chip_name.lower() in device_name.lower()
+
+
+def _lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype,
+                           self_chip=None):
+    """Return this chip's hardware scaling factor (chip_peak / reference_peak)
     for the resource that bottlenecks the baseline record, or None.
 
     Factor comes from base_data["_scaling_factors"] (written by the collector
-    into the same file as the latencies). Prefers measured over nominal. Returns
-    None when the vendor / resource / dtype isn't covered, so the caller falls
-    back to the raw latency ratio.
+    into the same file as the latencies). Matching is by vendor AND concrete
+    chip model, so that e.g. nvidia H800 and H100 don't collide. Prefers
+    measured over nominal. Returns None when the vendor / chip / resource /
+    dtype isn't covered, so the caller falls back to the raw latency ratio.
+
+    When we're running on the baseline's own reference chip (e.g. the H800 the
+    baseline was collected on), the factor is 1.0 by definition and that chip is
+    not listed under "chips", so short-circuit to 1.0.
     """
     try:
         sf = base_data.get("_scaling_factors")
         resource = _BOTTLENECK_TO_SF.get(bottle_neck_unit)
         if not sf or resource is None:
             return None
-        chip = next((c for c in sf.get("chips", [])
-                     if c.get("vendor") == vendor), None)
+        if self_chip is None:
+            self_chip = _SELF_CHIP
+        # Running on the reference chip itself: peaks are equal, factor == 1.0.
+        # This must win before vendor matching, since the reference chip is not
+        # in "chips" and a same-vendor sibling (H100) would be matched wrongly.
+        if _chip_matches(sf.get("reference_chip"), self_chip):
+            return 1.0
+        candidates = [c for c in sf.get("chips", []) if c.get("vendor") == vendor]
+        if not candidates:
+            return None
+        # Prefer the candidate whose chip model matches this device; only when a
+        # single vendor chip exists do we accept it without a model match.
+        chip = next((c for c in candidates
+                     if _chip_matches(c.get("chip"), self_chip)), None)
+        if chip is None:
+            chip = candidates[0] if len(candidates) == 1 else None
         if chip is None:
             return None
         for prefer in ("measured", "nominal"):

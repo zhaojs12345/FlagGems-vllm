@@ -103,16 +103,20 @@ def _load_base_data(path):
     break the benchmark run (silent degradation to N/A).
     """
     if not path:
+        print("[base-data] 未指定 --base-data，'vs Base' 列关闭。")
         return None
     try:
         with open(path, "r") as f:
-            return json.load(f)
-    except (OSError, ValueError) as e:
-        logging.getLogger(__name__).warning(
-            "Failed to load --base-data %s: %s; 'vs Base' column disabled.",
-            path,
-            e,
+            data = json.load(f)
+        n_ops = sum(1 for k in data if not k.startswith("_"))
+        has_sf = "_scaling_factors" in data
+        print(
+            f"[base-data] 已加载基线 {path}："
+            f"{n_ops} 个算子，_scaling_factors={'有' if has_sf else '无'}。"
         )
+        return data
+    except (OSError, ValueError) as e:
+        print(f"[base-data] 加载失败 {path}: {e}；'vs Base' 列关闭。")
         return None
 
 

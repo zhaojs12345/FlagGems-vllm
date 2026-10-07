@@ -646,6 +646,12 @@ def parse_perf_data(op, result_file):
     bench_res = {}
     records = data.get("details", [])
 
+    # Collect, deduplicated, every "no baseline match" reason reported by the
+    # benchmark layer (op / shape / dtype missing). Only populated when
+    # --base-data was passed and some shape failed to match.
+    base_miss_reasons = []
+    seen_reasons = set()
+
     for item in records:
         dtype = consts.DTYPE_MAP.get(item["dtype"], item["dtype"])
         details = {}
@@ -656,8 +662,23 @@ def parse_perf_data(op, result_file):
             details.setdefault(shape, {})
             details[shape]["base"] = res.get("latency_base", 0.0)
             details[shape]["gems"] = res.get("latency", 0.0)
+            # "speedup" defaults to the gems-vs-torch ratio measured on this
+            # machine. When --base-data matched this op/shape/dtype, overwrite
+            # it in place with the baseline comparison (vs Base) so summary.json
+            # carries that value directly in the same field. On a miss, keep the
+            # measured ratio unchanged and only record why the baseline was
+            # skipped.
             speedup = res.get("speedup", 0.0)
+            compared = res.get("compared_speedup", None)
+            if compared is not None:
+                speedup = compared
             details[shape]["speedup"] = speedup
+            miss = res.get("base_miss_reason", None)
+            if miss:
+                details[shape]["base_miss_reason"] = miss
+                if miss not in seen_reasons:
+                    seen_reasons.add(miss)
+                    base_miss_reasons.append(miss)
             count += 1
             total += speedup
 
@@ -674,11 +695,14 @@ def parse_perf_data(op, result_file):
                 "speedup": 0,
             }
 
-    return {
+    record = {
         "status": result.title(),
         "data": bench_res,
         "test_case": data.get("test_case", "Unknown"),
     }
+    if base_miss_reasons:
+        record["base_miss_reasons"] = base_miss_reasons
+    return record
 
 
 def run_accuracy_q(gpu_id, op):

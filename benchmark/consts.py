@@ -113,6 +113,9 @@ class BenchmarkMetrics:
     utilization: Optional[float] = None
     # Speedup compared to base data
     compared_speedup: Optional[float] = None
+    # Why the baseline comparison was skipped (op/shape/dtype missing).
+    # None means "matched" or "--base-data not enabled". Excluded from metrics.
+    base_miss_reason: Optional[str] = None
     # Error message
     error_msg: Optional[str] = None
 
@@ -120,6 +123,7 @@ class BenchmarkMetrics:
 ALL_AVAILABLE_METRICS = set(map(lambda x: x.name, fields(BenchmarkMetrics))) - {
     "legacy_shape",
     "shape_detail",
+    "base_miss_reason",
 }
 
 DEFAULT_METRICS = [
@@ -249,13 +253,17 @@ def _first_tensor_shape(shape_detail):
     return None
 
 
-def lookup_base_record(base_data, op_name, dtype, shape_detail):
-    """Look up the NVIDIA baseline record for a result, three levels deep:
-    op_name -> shape -> dtype. Returns the record dict (with latency_ms,
-    bottle_neck_unit, ...), or None if any level is missing. Never raises: an
-    unmatched entry just yields N/A.
+def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
+    """Look up the NVIDIA baseline record, three levels deep:
+    op_name -> shape -> dtype. Returns a (record, miss_reason) tuple:
 
-    Baseline layout (see tools/collect_baseline_nvidia.py):
+    - (record_dict, None)  when every level matched;
+    - (None, reason_str)   when any level is missing, where reason_str names
+                           exactly which level failed so callers can print a
+                           precise diagnostic and persist it.
+
+    Never raises: an unmatched entry just yields a reason. Baseline layout
+    (see tools/collect_baseline_nvidia.py):
         base_data[op_name]["shapes"][str([d0, d1, ...])][str(dtype)]
     The shape key is the string of the first tensor's dimensions, which matches
     the collector's key_shape for ops like grouped_topk / fused_add_rms_norm.
@@ -264,17 +272,37 @@ def lookup_base_record(base_data, op_name, dtype, shape_detail):
     try:
         op_entry = base_data.get(op_name)
         if not op_entry:
-            return None
+            return None, f"baseline 中没有算子 '{op_name}'"
         shapes = op_entry.get("shapes", {})
         first_shape = _first_tensor_shape(shape_detail)
         if first_shape is None:
-            return None
+            return None, (
+                f"算子 '{op_name}' 的 shape 无法表达为张量维度 "
+                f"(shape_detail={shape_detail})"
+            )
         per_dtype = shapes.get(str(first_shape))
         if not per_dtype:
-            return None
-        return per_dtype.get(str(dtype))
-    except (AttributeError, TypeError):
-        return None
+            return None, (
+                f"算子 '{op_name}' 在 baseline 中没有对应的 shape {first_shape}"
+            )
+        rec = per_dtype.get(str(dtype))
+        if rec is None:
+            return None, (
+                f"算子 '{op_name}' shape {first_shape} 在 baseline 中没有 "
+                f"对应的 dtype {dtype}"
+            )
+        return rec, None
+    except (AttributeError, TypeError) as e:
+        return None, f"baseline 查找 '{op_name}' 时出错: {e}"
+
+
+def lookup_base_record(base_data, op_name, dtype, shape_detail):
+    """Backward-compatible wrapper: returns just the record dict, or None.
+
+    Prefer lookup_base_record_ex when the miss reason is needed.
+    """
+    rec, _ = lookup_base_record_ex(base_data, op_name, dtype, shape_detail)
+    return rec
 
 
 def _detect_self_chip():

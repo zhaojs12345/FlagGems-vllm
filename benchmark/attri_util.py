@@ -94,6 +94,9 @@ class BenchmarkMetrics:
     utilization: Optional[float] = None
     # Speedup compared to base data
     compared_speedup: Optional[float] = None
+    # Why the baseline comparison was skipped (op/shape/dtype missing).
+    # None means "matched" or "--base-data not enabled". Excluded from metrics.
+    base_miss_reason: Optional[str] = None
     # Error message
     error_msg: Optional[str] = None
 
@@ -101,6 +104,7 @@ class BenchmarkMetrics:
 ALL_AVAILABLE_METRICS = set(map(lambda x: x.name, fields(BenchmarkMetrics))) - {
     "legacy_shape",
     "shape_detail",
+    "base_miss_reason",
 }
 
 DEFAULT_METRICS = [

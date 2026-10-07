@@ -34,7 +34,7 @@ from .consts import (
     BenchmarkResult,
     OperationAttribute,
     check_metric_dependencies,
-    lookup_base_record,
+    lookup_base_record_ex,
     lookup_scaling_factor,
     model_shapes,
 )
@@ -464,7 +464,7 @@ class Benchmark:
                     if "speedup" in self.to_bench_metrics:
                         metric.speedup = metric.latency_base / metric.latency
                     if Config.base_data is not None and metric.latency:
-                        base_rec = lookup_base_record(
+                        base_rec, miss_reason = lookup_base_record_ex(
                             Config.base_data,
                             self.op_name,
                             dtype,
@@ -492,6 +492,12 @@ class Benchmark:
                                 f"base={base_ms:.6f}ms gems={metric.latency:.6f}ms "
                                 f"factor={factor} vs_base={speedup:.3f}"
                             )
+                        else:
+                            # No baseline match: record and print the precise
+                            # reason (op / shape / dtype missing) so it can be
+                            # aggregated later.
+                            metric.base_miss_reason = miss_reason
+                            print(f"[vs Base][未匹配] {miss_reason}")
 
                     if "gbps" in self.to_bench_metrics:
                         metric.gbps_base = self.get_gbps(

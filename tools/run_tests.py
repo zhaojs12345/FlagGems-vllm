@@ -777,7 +777,15 @@ def run_benchmark_q(gpu_id, op):
     dur = time.time()
     cmd = f'pytest -m "{op}" --level core --record json --output benchmark_{op}.json --continue-on-collection-errors'
     if getattr(CFG, "base_data", None):
-        cmd += f" --base-data {shlex.quote(CFG.base_data)}"
+        # Use "--base-data=<path>" (with '=') rather than a space-separated
+        # value. pytest resolves rootdir BEFORE conftest registers this option,
+        # so a space-separated absolute path (e.g. one living outside the repo)
+        # is mistaken for a positional test path, dragging rootdir to that
+        # path's directory. Then pytest.ini is not found and every custom option
+        # (--level/--record/--base-data) becomes "unrecognized". Gluing the
+        # value with '=' keeps it a single '--'-prefixed token that early
+        # parsing ignores, so rootdir stays inside the repo.
+        cmd += f" --base-data={shlex.quote(CFG.base_data)}"
     code = run_cmd(op, cmd, cwd=benchmark_dir, env=env, flavor="performance")
     dur = time.time() - dur
 

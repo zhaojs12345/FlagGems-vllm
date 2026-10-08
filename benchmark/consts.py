@@ -262,6 +262,141 @@ def _first_tensor_shape(shape_detail):
     return None
 
 
+def _all_tensor_shapes_from_record(shape_detail):
+    """从 record_shapes() 结果里收集**所有**张量 shape，返回排序后的元组。
+
+    与 _first_tensor_shape 不同，这里不只取第一个张量，而是深度遍历整个结构
+    （args+kwargs 嵌套的 list/tuple/dict），把每个 torch.Size 收进来。张量
+    shape 的「多重集合」在同一算子内几乎总能唯一区分一个采集点，用它做签名
+    就能绕开「baseline 的 key_shape 是语义复合键、与第一个张量 shape 不一致」
+    导致的匹配失败（见下方 lookup_base_record_ex 的签名回退）。
+    """
+    shapes = []
+    stack = [shape_detail]
+    while stack:
+        item = stack.pop(0)
+        if isinstance(item, torch.Size):
+            shapes.append(tuple(item))
+        elif isinstance(item, dict):
+            stack[:0] = list(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack[:0] = list(item)
+    return tuple(sorted(shapes))
+
+
+def _all_scalars_from_record(shape_detail):
+    """收集 record_shapes() 结果里的标量（int/float/str/bool），排序后返回。
+
+    仅用于「张量 shape 相同、靠标量区分」的少数算子（如 per_token_group_quant_fp8
+    的 use_ue8m0、persistent_topk 的 max_seq_len）做二次判别。torch.Size 已在
+    上面单独处理，这里只收散落的标量。bool 要先于 int 判断（isinstance(True,int)）。
+    """
+    scalars = []
+    stack = [shape_detail]
+    while stack:
+        item = stack.pop(0)
+        if isinstance(item, torch.Size):
+            continue
+        if isinstance(item, dict):
+            stack[:0] = list(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack[:0] = list(item)
+        elif isinstance(item, bool):
+            scalars.append(repr(item))
+        elif isinstance(item, (int, float, str)):
+            scalars.append(repr(item))
+    return tuple(sorted(scalars))
+
+
+def _base_shapes_from_config(cfg):
+    """从 baseline 记录的 config.inputs 里收集所有张量 shape（排序元组）。
+
+    与 _all_tensor_shapes_from_record 对称：采集器把每个输入张量写成
+    {"shape": [...]}，标量写成 {"scalar": v}。缺 config/inputs 时返回 None，
+    表示该采集点无法用签名匹配（只能靠原始 key）。
+    """
+    if not isinstance(cfg, dict):
+        return None
+    inputs = cfg.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+    shapes = []
+    for v in inputs.values():
+        if isinstance(v, dict) and isinstance(v.get("shape"), list):
+            shapes.append(tuple(v["shape"]))
+    return tuple(sorted(shapes))
+
+
+def _base_scalars_from_config(cfg):
+    """从 baseline config.inputs 里收集标量值（排序元组），与记录侧对称。"""
+    scalars = []
+    inputs = (cfg or {}).get("inputs", {})
+    if isinstance(inputs, dict):
+        for v in inputs.values():
+            if isinstance(v, dict) and "scalar" in v:
+                scalars.append(repr(v["scalar"]))
+    return tuple(sorted(scalars))
+
+
+# 每个 (base_data, op_name) 的「张量签名 -> shape key」索引，按 base_data 的 id
+# 缓存，避免每个采集点都重建。值为 {dtype: {tensor_sig: [shape_key,...]}}。
+_SIG_INDEX_CACHE = {}
+
+
+def _build_signature_index(base_data, op_name):
+    """为某算子构建 {dtype: {tensor_sig: [shape_key,...]}} 索引（带缓存）。"""
+    cache_key = (id(base_data), op_name)
+    cached = _SIG_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    index = {}
+    op_entry = base_data.get(op_name) or {}
+    for shape_key, per_dtype in op_entry.get("shapes", {}).items():
+        if not isinstance(per_dtype, dict):
+            continue
+        for dtype_str, rec in per_dtype.items():
+            if not isinstance(rec, dict):
+                continue
+            sig = _base_shapes_from_config(rec.get("config"))
+            if not sig:
+                continue
+            index.setdefault(dtype_str, {}).setdefault(sig, []).append(shape_key)
+    _SIG_INDEX_CACHE[cache_key] = index
+    return index
+
+
+def _match_by_signature(base_data, op_name, dtype, shape_detail):
+    """张量签名回退匹配：返回 (record, matched_shape_key) 或 (None, None)。
+
+    直接用 str(first_shape) 匹配失败时调用。按「所有张量 shape 的多重集合」在
+    该 (op, dtype) 下查找；若多个 shape key 的张量签名相同（极少数算子），再用
+    标量集合做二次判别。仍无法唯一定位则放弃（返回 None），由调用方按原逻辑报
+    未匹配，绝不臆测。
+    """
+    index = _build_signature_index(base_data, op_name)
+    per_dtype = index.get(str(dtype))
+    if not per_dtype:
+        return None, None
+    sig = _all_tensor_shapes_from_record(shape_detail)
+    keys = per_dtype.get(sig)
+    if not keys:
+        return None, None
+    op_shapes = base_data[op_name]["shapes"]
+    if len(keys) == 1:
+        return op_shapes[keys[0]].get(str(dtype)), keys[0]
+    # 张量签名碰撞：用标量集合二次判别。
+    rec_scalars = _all_scalars_from_record(shape_detail)
+    for k in keys:
+        rec = op_shapes[k].get(str(dtype))
+        if rec is None:
+            continue
+        base_scalars = _base_scalars_from_config(rec.get("config"))
+        # baseline 标量应为记录侧标量的子集（记录侧常含 stride 等额外散落 int）。
+        if base_scalars and set(base_scalars) <= set(rec_scalars):
+            return rec, k
+    return None, None
+
+
 def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
     """Look up the NVIDIA baseline record, three levels deep:
     op_name -> shape -> dtype. Returns a (record, miss_reason) tuple:
@@ -289,18 +424,33 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
                 f"算子 '{op_name}' 的 shape 无法表达为张量维度 "
                 f"(shape_detail={shape_detail})"
             )
+        # 优先按原始 key（str(第一个张量 shape)）直查——简单算子的 key_shape 恰为
+        # 第一个张量 shape，命中率高且无歧义。
         per_dtype = shapes.get(str(first_shape))
-        if not per_dtype:
-            return None, (
-                f"算子 '{op_name}' 在 baseline 中没有对应的 shape {first_shape}"
-            )
-        rec = per_dtype.get(str(dtype))
-        if rec is None:
+        if per_dtype:
+            rec = per_dtype.get(str(dtype))
+            if rec is not None:
+                return rec, None
+        # 直查未命中：多数复杂算子的 baseline key_shape 是语义复合键（如
+        # flash_mla 的 [B,S_q,H_q,D,seqlen]）或字符串键（如 t1_e8_h4096...），
+        # 与第一个张量 shape 不一致。改用「全部张量 shape 的多重集合」签名回退
+        # 匹配——与采集器 config.inputs 对称、两边口径一致。
+        rec, matched_key = _match_by_signature(
+            base_data, op_name, dtype, shape_detail
+        )
+        if rec is not None:
+            return rec, None
+        # 仍未命中：区分「该 shape 签名在 baseline 不存在」与「shape 在但 dtype
+        # 缺」两种原因，给出精确诊断。
+        if str(first_shape) in shapes and shapes[str(first_shape)].get(str(dtype)) is None:
             return None, (
                 f"算子 '{op_name}' shape {first_shape} 在 baseline 中没有 "
                 f"对应的 dtype {dtype}"
             )
-        return rec, None
+        return None, (
+            f"算子 '{op_name}' 在 baseline 中没有匹配的 shape"
+            f"（第一个张量={first_shape}，已尝试张量签名回退）"
+        )
     except (AttributeError, TypeError) as e:
         return None, f"baseline 查找 '{op_name}' 时出错: {e}"
 
